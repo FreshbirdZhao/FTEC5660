@@ -17,7 +17,7 @@ Only edit the two functions in `hw1.py` that contain `### YOUR CODE HERE`:
 
 - `build_chain()` creates your LangChain chain.
 - `answer_queries()` runs the chain on the receipt images and returns one final
-  response for each question.
+response for each question.
 
 You may use prompt chaining, routing, parallel calls, reflection, or a
 combination. Your final responses should each contain one HKD amount. Do not
@@ -47,7 +47,6 @@ The required model is `deepseek-v4-flash-vision-exp`, the vision-capable
 DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
-
 ## Homework 1 solution
 
 ```mermaid
@@ -62,8 +61,7 @@ flowchart LR
     G --> H[Two exact HKD responses]
 ```
 
+
+
 The chain sends each receipt separately to `deepseek-v4-flash-vision-exp` through LangChain so that the model only has to inspect one image at a time. A strict multimodal prompt extracts the final payment after rounding, the subtotal before rounding, and all discount lines into a four-field JSON object. The program validates the JSON, checks that the no-discount amount equals the subtotal plus discounts, checks that the payment is consistent with rounding, and asks the model to re-read any unreliable receipt. Finally, Python `Decimal` arithmetic aggregates the validated values and formats each required response as exactly one HKD amount.
 
-## Task 2 reflection
-
-The most relevant AI-related event for me during the past ten days was building and testing a multimodal receipt-analysis workflow. It made me view AI less as a single chatbot and more as a component that must be designed, tested, and monitored inside a larger system. The vision model can read a receipt, but dependable results still require a precise prompt, structured output, arithmetic validation, retries, and deterministic aggregation. This experience changed my career plan by increasing my interest in building reliable AI applications for business and FinTech rather than focusing only on model training. I want to strengthen both my AI skills and my knowledge of software engineering, data governance, privacy, and financial controls, because production systems need traceability and human oversight as much as they need model capability.
