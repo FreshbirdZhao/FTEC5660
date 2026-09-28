@@ -63,7 +63,36 @@ def build_chain() -> Any:
     ``deepseek-v4-flash-vision-exp``. The API key is loaded from .env.
     """
     ### YOUR CODE HERE
-    return None
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_deepseek import ChatDeepSeek
+
+    extraction_instructions = """You are a meticulous forensic accountant reading one Hong Kong supermarket receipt.
+Read the receipt image twice before answering. Return only one valid JSON object with exactly these four keys:
+{{"amount_paid": "0.00", "subtotal": "0.00", "discount_total": "0.00", "without_discount": "0.00"}}
+
+Rules:
+- amount_paid is the final amount actually paid after the ROUNDING line. Use the final payment/settlement amount, not cash tendered, change, balance, savings, or the pre-rounding subtotal.
+- subtotal is the receipt's SUBTOTAL after all discounts but before ROUNDING.
+- discount_total is the sum of the absolute values of every discount, promotion, coupon, member, app, packaging-damage, and percentage-off line. Exclude ROUNDING, payment, tender, and change lines.
+- without_discount must equal subtotal + discount_total. Independently check it against the sum of the original positive item prices.
+- Read decimal points and minus signs carefully. Ignore dates, times, quantities, product codes, loyalty points, and percentages as monetary amounts.
+- Use HKD, exactly two decimal places, no currency symbols, no thousands separators, no explanations, and no Markdown fences.
+"""
+
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", extraction_instructions),
+            MessagesPlaceholder(variable_name="receipt"),
+        ]
+    )
+    model = ChatDeepSeek(
+        model="deepseek-v4-flash-vision-exp",
+        temperature=0,
+        max_tokens=4096,
+        timeout=120,
+        max_retries=3,
+    )
+    return prompt | model
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -79,8 +108,81 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     to process independent receipt-extraction prompts in parallel.
     """
     ### YOUR CODE HERE
-    _ = (chain, images)
-    return {QUERY_1: DUMMY_RESPONSE, QUERY_2: DUMMY_RESPONSE}
+    from langchain_core.messages import HumanMessage
+
+    cent = Decimal("0.01")
+
+    def receipt_message(path: Path, correction: str = "") -> HumanMessage:
+        instruction = (
+            f"Extract the four required totals from receipt {path.name}. "
+            "Return the JSON object only."
+        )
+        if correction:
+            instruction += f" The previous extraction was unreliable: {correction} Re-read the image and correct it."
+        return HumanMessage(
+            content=[
+                {"type": "text", "text": instruction},
+                {"type": "image_url", "image_url": {"url": image_data_url(path)}},
+            ]
+        )
+
+    def parse_extraction(value: Any) -> dict[str, Decimal]:
+        text = response_text(value)
+        object_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if object_match is None:
+            raise ValueError("response did not contain a JSON object")
+        data = json.loads(object_match.group(0))
+
+        extracted: dict[str, Decimal] = {}
+        for key in ("amount_paid", "subtotal", "discount_total", "without_discount"):
+            raw_value = data.get(key)
+            money_match = re.fullmatch(
+                r"\s*(?:HK\$|\$)?\s*(-?\d[\d,]*(?:\.\d+)?)\s*",
+                str(raw_value),
+                flags=re.IGNORECASE,
+            )
+            if money_match is None:
+                raise ValueError(f"invalid {key}: {raw_value!r}")
+            extracted[key] = Decimal(money_match.group(1).replace(",", "")).quantize(cent)
+
+        if extracted["amount_paid"] < 0 or extracted["subtotal"] < 0:
+            raise ValueError("paid amount and subtotal must be non-negative")
+        if extracted["discount_total"] < 0:
+            extracted["discount_total"] = -extracted["discount_total"]
+        expected_without_discount = extracted["subtotal"] + extracted["discount_total"]
+        if abs(extracted["without_discount"] - expected_without_discount) > cent:
+            raise ValueError("without_discount does not equal subtotal plus discounts")
+        if abs(extracted["amount_paid"] - extracted["subtotal"]) > Decimal("0.10"):
+            raise ValueError("final payment is inconsistent with subtotal and rounding")
+        extracted["without_discount"] = expected_without_discount.quantize(cent)
+        return extracted
+
+    inputs = [{"receipt": [receipt_message(path)]} for path in images]
+    raw_results = chain.batch(inputs, config={"max_concurrency": 3}, return_exceptions=True)
+
+    extractions: list[dict[str, Decimal]] = []
+    for path, raw_result in zip(images, raw_results):
+        result = raw_result
+        last_error = "model request failed" if isinstance(result, Exception) else ""
+        for attempt in range(3):
+            if not isinstance(result, Exception):
+                try:
+                    extractions.append(parse_extraction(result))
+                    break
+                except (ValueError, InvalidOperation, json.JSONDecodeError) as error:
+                    last_error = str(error)
+            if attempt == 2:
+                raise RuntimeError(f"Could not extract reliable totals from {path.name}: {last_error}")
+            result = chain.invoke({"receipt": [receipt_message(path, last_error)]})
+
+    total_paid = sum((item["amount_paid"] for item in extractions), Decimal("0.00"))
+    total_without_discount = sum(
+        (item["without_discount"] for item in extractions), Decimal("0.00")
+    )
+    return {
+        QUERY_1: f"HK${total_paid.quantize(cent):.2f}",
+        QUERY_2: f"HK${total_without_discount.quantize(cent):.2f}",
+    }
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
