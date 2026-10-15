@@ -47,7 +47,19 @@ The required model is `deepseek-v4-flash-vision-exp`, the vision-capable
 DeepSeek Flash model. JPEG, PNG, GIF, and WebP inputs are accepted by the
 homework runner.
 
+## Homework 1 solution
 
-## Homework 1 solution: 
-> to students: please fill your solution description here.
+```mermaid
+flowchart LR
+    A[Receipt folder] --> B[Load and encode images]
+    B --> C[Parallel DeepSeek vision calls]
+    C --> D[Extract paid, subtotal, discounts]
+    D --> E{JSON and arithmetic checks}
+    E -->|invalid| F[Re-read image and retry]
+    F --> D
+    E -->|valid| G[Decimal aggregation]
+    G --> H[Two exact HKD responses]
+```
+
+The chain sends each receipt separately to `deepseek-v4-flash-vision-exp` through LangChain so that the model only has to inspect one image at a time. A strict multimodal prompt extracts the final payment after rounding, the subtotal before rounding, and all discount lines into a four-field JSON object. The program validates the JSON, checks that the no-discount amount equals the subtotal plus discounts, checks that the payment is consistent with rounding, and asks the model to re-read any unreliable receipt. Finally, Python `Decimal` arithmetic aggregates the validated values and formats each required response as exactly one HKD amount.
 
