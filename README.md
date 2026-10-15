@@ -52,14 +52,16 @@ homework runner.
 ```mermaid
 flowchart LR
     A[Receipt folder] --> B[Load and encode images]
-    B --> C[Parallel DeepSeek vision calls]
-    C --> D[Extract paid, subtotal, discounts]
-    D --> E{JSON and arithmetic checks}
-    E -->|invalid| F[Re-read image and retry]
+    B --> C[Two independent DeepSeek vision reads per receipt]
+    C --> D[Extract item total, every discount line, subtotal, rounding, paid]
+    D --> E{JSON + arithmetic checks}
+    E -->|item_total != subtotal + discounts| F[Re-read with the exact error]
+    E -->|reads disagree| F
     F --> D
-    E -->|valid| G[Decimal aggregation]
+    E -->|agreement or checks pass| G[Decimal aggregation]
     G --> H[Two exact HKD responses]
 ```
 
-The chain sends each receipt separately to `deepseek-v4-flash-vision-exp` through LangChain so that the model only has to inspect one image at a time. A strict multimodal prompt extracts the final payment after rounding, the subtotal before rounding, and all discount lines into a four-field JSON object. The program validates the JSON, checks that the no-discount amount equals the subtotal plus discounts, checks that the payment is consistent with rounding, and asks the model to re-read any unreliable receipt. Finally, Python `Decimal` arithmetic aggregates the validated values and formats each required response as exactly one HKD amount.
+The chain sends each receipt separately to `deepseek-v4-flash-vision-exp` through LangChain so the model only has to inspect one image at a time. A strict multimodal prompt returns a five-field JSON object: the original item total, **every** discount line listed individually, the printed subtotal, the signed rounding, and the final payment. Each receipt is read twice, because a single internally consistent answer can still drop a discount line: a reading is accepted only when the arithmetic checks pass — `amount_paid == subtotal + rounding` and `item_total == subtotal + sum(discount lines)` — and two independent reads agree. Any receipt that fails is re-read with the exact error or the disagreement in the prompt, up to three extra attempts, and a receipt that still cannot be read is reported and counted as 0.00 instead of being silently patched. Finally, Python `Decimal` arithmetic aggregates the validated values and formats each required response as exactly one HKD amount.
+
 

@@ -67,16 +67,22 @@ def build_chain() -> Any:
     from langchain_deepseek import ChatDeepSeek
 
     extraction_instructions = """You are a meticulous forensic accountant reading one Hong Kong supermarket receipt.
-Read the receipt carefully but keep your reasoning brief. Return only one valid JSON object with exactly these four keys:
-{{"amount_paid": "0.00", "subtotal": "0.00", "discount_total": "0.00", "without_discount": "0.00"}}
+Return only one valid JSON object with exactly these keys:
+{{"item_total": "0.00", "discounts": [{{"label": "short label", "amount": "0.00"}}], "subtotal": "0.00", "rounding": "0.00", "amount_paid": "0.00"}}
+
+Definitions:
+- item_total: the sum of every ORIGINAL positive item price printed on the receipt, BEFORE any discount is applied. Include each product line at its printed price and never subtract anything here.
+- discounts: EVERY line that reduces the bill (promotion, coupon, member, app, percentage-off, packaging-damage, "X% OFF", "SAVE", "DISC"). Give one entry per printed discount line with the amount as a POSITIVE number. Never include ROUNDING, payment, tender, change, loyalty points, or the SUBTOTAL line.
+- subtotal: the receipt's printed SUBTOTAL, the total after all discounts and before ROUNDING.
+- rounding: the signed ROUNDING amount exactly as printed (for example -0.01 or 0.05); use 0.00 when the receipt has no rounding line.
+- amount_paid: the final amount actually paid after rounding (the payment/settlement amount such as OCTOPUS/EPS/CASH), not cash tendered, change, balance, or savings.
 
 Rules:
-- amount_paid is the final amount actually paid after the ROUNDING line. Use the final payment/settlement amount, not cash tendered, change, balance, savings, or the pre-rounding subtotal.
-- subtotal is the receipt's SUBTOTAL after all discounts but before ROUNDING.
-- discount_total is the sum of the absolute values of every discount, promotion, coupon, member, app, packaging-damage, and percentage-off line. Exclude ROUNDING, payment, tender, and change lines.
-- without_discount must equal subtotal + discount_total. Independently check it against the sum of the original positive item prices.
-- Read decimal points and minus signs carefully. Ignore dates, times, quantities, product codes, loyalty points, and percentages as monetary amounts.
-- Use HKD, exactly two decimal places, no currency symbols, no thousands separators, no explanations, and no Markdown fences.
+- Read the discount lines one by one; do not confuse the SUBTOTAL with a discount.
+- Read decimal points and minus signs carefully.
+- Ignore dates, times, quantities, product codes, loyalty points and percentages as monetary amounts.
+- Exactly two decimal places, no currency symbols, no thousands separators, no explanations, no Markdown fences.
+- Before answering, verify that item_total equals subtotal plus the sum of all discount amounts.
 """
 
     prompt = ChatPromptTemplate.from_messages(
@@ -88,8 +94,8 @@ Rules:
     model = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
         temperature=0,
-        max_tokens=8192,
-        timeout=120,
+        max_tokens=16384,
+        timeout=180,
         max_retries=3,
     )
     # This is a reasoning model: it emits a long hidden chain of thought before the
@@ -115,21 +121,28 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     from langchain_core.messages import HumanMessage
 
     cent = Decimal("0.01")
+    tolerance = Decimal("0.02")
 
-    def receipt_message(path: Path, correction: str = "", terse: bool = False) -> HumanMessage:
-        instruction = (
-            f"Extract the four required totals from receipt {path.name}. "
-            "Return the JSON object only."
+    def money(value: Any, field: str) -> Decimal:
+        """Parse one monetary amount from the model's JSON."""
+        money_match = re.fullmatch(
+            r"\s*(?:HK\$|\$)?\s*(-?\d[\d,]*(?:\.\d+)?)\s*",
+            str(value),
+            flags=re.IGNORECASE,
         )
-        if terse:
-            instruction += (
-                " Work quickly: keep your notes short, do not restate the receipt "
-                "line by line, then output the JSON object."
-            )
+        if money_match is None:
+            raise ValueError(f"invalid {field}: {value!r}")
+        return Decimal(money_match.group(1).replace(",", "")).quantize(cent)
+
+    def receipt_message(path: Path, correction: str = "") -> HumanMessage:
+        instruction = (
+            f"Analyse receipt {path.name} and return the JSON object only. "
+            "Write down every discount line separately before you total them."
+        )
         if correction:
             instruction += (
-                f" The previous attempt failed: {correction[:300]} "
-                "Re-read the image and return the JSON object."
+                f"\nThe previous attempt was rejected: {correction[:300]}"
+                "\nRe-read the image carefully, fix that problem, and return the JSON object."
             )
         return HumanMessage(
             content=[
@@ -149,103 +162,177 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
                     text = f"{text}\n{reasoning}"
         return text
 
-    def parse_extraction(value: Any) -> dict[str, Decimal]:
+    def json_object(value: Any) -> dict:
         text = re.sub(r"```(?:json)?", "", response_body(value))
-        candidates = re.findall(r"\{[^{}]*\}", text, flags=re.DOTALL) or re.findall(
-            r"\{.*\}", text, flags=re.DOTALL
-        )
-        data: Any = None
-        for candidate in reversed(candidates):
+        for candidate in reversed(re.findall(r"\{.*\}", text, flags=re.DOTALL)):
             try:
                 parsed_candidate = json.loads(candidate)
             except (ValueError, json.JSONDecodeError):
                 continue
             if isinstance(parsed_candidate, dict) and "amount_paid" in parsed_candidate:
-                data = parsed_candidate
-                break
-        if data is None:
-            raise ValueError("response did not contain a usable JSON object")
+                return parsed_candidate
+        raise ValueError("response did not contain a usable JSON object")
 
-        extracted: dict[str, Decimal] = {}
-        for key in ("amount_paid", "subtotal", "discount_total", "without_discount"):
-            raw_value = data.get(key)
-            money_match = re.fullmatch(
-                r"\s*(?:HK\$|\$)?\s*(-?\d[\d,]*(?:\.\d+)?)\s*",
-                str(raw_value),
-                flags=re.IGNORECASE,
-            )
-            if money_match is None:
-                raise ValueError(f"invalid {key}: {raw_value!r}")
-            extracted[key] = Decimal(money_match.group(1).replace(",", "")).quantize(cent)
+    def parse_extraction(value: Any, strict: bool = True) -> dict[str, Decimal]:
+        """Read the five-field JSON and cross-check it with independent arithmetic.
 
-        if extracted["amount_paid"] < 0 or extracted["subtotal"] < 0:
-            raise ValueError("paid amount and subtotal must be non-negative")
-        if extracted["discount_total"] < 0:
-            extracted["discount_total"] = -extracted["discount_total"]
-        expected_without_discount = extracted["subtotal"] + extracted["discount_total"]
-        if abs(extracted["without_discount"] - expected_without_discount) > cent:
-            raise ValueError("without_discount does not equal subtotal plus discounts")
-        if abs(extracted["amount_paid"] - extracted["subtotal"]) > Decimal("0.10"):
-            raise ValueError("final payment is inconsistent with subtotal and rounding")
-        extracted["without_discount"] = expected_without_discount.quantize(cent)
-        return extracted
+        A missed or misread discount line stays self-consistent in the old
+        ``subtotal + discount_total`` scheme, so the model must also report the
+        original item total: ``item_total == subtotal + sum(discounts)`` is an
+        independent check that exposes a missing line.
+        """
+        data = json_object(value)
+        subtotal = money(data.get("subtotal"), "subtotal")
+        amount_paid = money(data.get("amount_paid"), "amount_paid")
+        rounding = money(data.get("rounding", "0.00"), "rounding")
 
-    inputs = [{"receipt": [receipt_message(path)]} for path in images]
-    raw_results = chain.batch(inputs, config={"max_concurrency": 3}, return_exceptions=True)
+        raw_discounts = data.get("discounts")
+        discount_lines: list[Decimal] = []
+        if isinstance(raw_discounts, list):
+            for entry in raw_discounts:
+                amount = entry.get("amount") if isinstance(entry, dict) else entry
+                discount_lines.append(abs(money(amount, "discount line")))
+            discount_total = sum(discount_lines, Decimal("0.00")).quantize(cent)
+        elif raw_discounts is None:
+            discount_total = Decimal("0.00")
+        else:
+            discount_total = abs(money(raw_discounts, "discounts")).quantize(cent)
+
+        raw_item_total = data.get("item_total")
+        item_total = None if raw_item_total is None else money(raw_item_total, "item_total")
+
+        if strict:
+            if subtotal <= 0 or amount_paid <= 0:
+                raise ValueError("subtotal and amount_paid must be positive")
+            if abs(rounding) > Decimal("0.10"):
+                raise ValueError(f"rounding {rounding} is too large")
+            if abs(amount_paid - (subtotal + rounding)) > cent:
+                raise ValueError(
+                    f"amount_paid {amount_paid} does not equal subtotal {subtotal} "
+                    f"plus rounding {rounding}"
+                )
+            if item_total is not None:
+                expected_items = (subtotal + discount_total).quantize(cent)
+                if abs(item_total - expected_items) > tolerance:
+                    raise ValueError(
+                        f"item_total {item_total} does not equal subtotal {subtotal} plus "
+                        f"discounts {discount_total} = {expected_items}; a discount line "
+                        "may be missing or misread"
+                    )
+
+        return {
+            "amount_paid": amount_paid,
+            "subtotal": subtotal,
+            "discount_total": discount_total,
+            "without_discount": (subtotal + discount_total).quantize(cent),
+        }
+
+    def lenient(value: Any) -> dict[str, Decimal] | None:
+        try:
+            return parse_extraction(value, strict=False)
+        except (ValueError, InvalidOperation, json.JSONDecodeError):
+            return None
+
+    def interpret(value: Any) -> tuple[dict[str, Decimal] | None, str, dict[str, Decimal] | None]:
+        if isinstance(value, Exception):
+            return None, f"the model request failed ({type(value).__name__})", None
+        try:
+            return parse_extraction(value), "", None
+        except (ValueError, InvalidOperation, json.JSONDecodeError) as error:
+            return None, str(error), lenient(value)
+
+    def reading_key(item: dict[str, Decimal]) -> tuple[Decimal, Decimal, Decimal]:
+        return (item["amount_paid"], item["subtotal"], item["discount_total"])
+
+    def agreed_reading(readings: list[dict[str, Decimal]]) -> dict[str, Decimal] | None:
+        """Return a reading that at least two independent passes agree on."""
+        if len(readings) < 2:
+            return None
+        counts: dict[tuple[Decimal, Decimal, Decimal], int] = {}
+        for item in readings:
+            key = reading_key(item)
+            counts[key] = counts.get(key, 0) + 1
+        best_key, best_count = max(counts.items(), key=lambda pair: pair[1])
+        if best_count < 2:
+            return None
+        for item in readings:
+            if reading_key(item) == best_key:
+                return item
+        return None
+
+    def describe(item: dict[str, Decimal]) -> str:
+        return (
+            f"paid {item['amount_paid']}, subtotal {item['subtotal']}, "
+            f"discounts {item['discount_total']}"
+        )
+
+    def read_once(path: Path, correction: str = "") -> Any:
+        try:
+            return chain.invoke({"receipt": [receipt_message(path, correction)]})
+        except Exception as error:  # noqa: BLE001 - the runner must never abort
+            return error
+
+    # Read every receipt twice: a single internally consistent reading can still
+    # be wrong, because the model may drop a discount line from both item_total
+    # and the discount list. Two independent passes expose that disagreement.
+    rounds = [
+        chain.batch(
+            [{"receipt": [receipt_message(path)]} for path in images],
+            config={"max_concurrency": 3},
+            return_exceptions=True,
+        )
+        for _ in range(2)
+    ]
 
     extractions: dict[str, dict[str, Decimal]] = {}
-    unreadable: list[str] = []
-    for path, raw_result in zip(images, raw_results):
-        result = raw_result
-        last_error = "model request failed" if isinstance(result, Exception) else ""
-        if isinstance(result, Exception):
-            print(f"warning: {path.name} initial request failed ({type(result).__name__})")
-        parsed: dict[str, Decimal] | None = None
-        for attempt in range(4):
-            if not isinstance(result, Exception):
-                try:
-                    parsed = parse_extraction(result)
-                    break
-                except (ValueError, InvalidOperation, json.JSONDecodeError) as error:
-                    last_error = str(error)
-                    if not response_text(result).strip():
-                        last_error += "; the model response was empty, likely truncated"
-                    print(f"warning: {path.name} attempt {attempt + 1} rejected ({last_error[:200]})")
-            try:
-                # A terser prompt on retry curbs the hidden reasoning that can
-                # otherwise consume the whole token budget a second time.
-                result = chain.invoke(
-                    {"receipt": [receipt_message(path, last_error, terse=True)]}
-                )
-            except Exception as error:
-                result = error
-                last_error = f"model request failed ({type(error).__name__})"
-                print(f"warning: {path.name} attempt {attempt + 1} request failed ({last_error[:200]})")
-        if parsed is None:
-            print(f"warning: {path.name} unreadable after retries ({last_error})")
-            unreadable.append(path.name)
-            continue
-        extractions[path.name] = parsed
+    for index, path in enumerate(images):
+        readings: list[dict[str, Decimal]] = []
+        best_effort: dict[str, Decimal] | None = None
+        correction = ""
+        for round_results in rounds:
+            parsed, error, fallback = interpret(round_results[index])
+            if parsed is None:
+                correction = error or correction
+                print(f"warning: {path.name} read rejected ({error[:200]})")
+            else:
+                readings.append(parsed)
+            if best_effort is None:
+                best_effort = fallback
 
-    if unreadable:
-        # Never abort the run: results.csv must exist even when a receipt could not
-        # be read, so substitute the median totals of the receipts we did read.
-        print(f"warning: could not read {', '.join(unreadable)}; using median totals")
-        paid_pool = sorted(
-            (item["amount_paid"] for item in extractions.values()), reverse=True
-        ) or [Decimal("0.00")]
-        nodisc_pool = sorted(
-            (item["without_discount"] for item in extractions.values()), reverse=True
-        ) or [Decimal("0.00")]
-        median_paid = paid_pool[len(paid_pool) // 2]
-        median_nodisc = nodisc_pool[len(nodisc_pool) // 2]
-        for name in unreadable:
-            extractions[name] = {
-                "amount_paid": median_paid,
-                "subtotal": median_paid,
+        attempt = 0
+        while agreed_reading(readings) is None and attempt < 3:
+            if len(readings) >= 2:
+                correction = (
+                    "two independent reads disagreed ("
+                    + " ; ".join(describe(item) for item in readings[-2:])
+                    + "); re-read the receipt line by line and correct the wrong one"
+                )
+            result = read_once(path, correction)
+            parsed, error, fallback = interpret(result)
+            if parsed is None:
+                correction = error or correction
+                print(f"warning: {path.name} extra read {attempt + 1} rejected ({error[:200]})")
+            else:
+                correction = ""
+                readings.append(parsed)
+            if best_effort is None:
+                best_effort = fallback
+            attempt += 1
+
+        chosen = agreed_reading(readings) or (readings[0] if readings else None) or best_effort
+        if chosen is None:
+            # Never abort the run: results.csv must exist, so a receipt that gave
+            # no usable numbers at all is counted as 0.00 and reported.
+            print(f"warning: {path.name} unreadable after retries; counting it as 0.00")
+            chosen = {
+                "amount_paid": Decimal("0.00"),
+                "subtotal": Decimal("0.00"),
                 "discount_total": Decimal("0.00"),
-                "without_discount": median_nodisc,
+                "without_discount": Decimal("0.00"),
             }
+        elif chosen not in readings:
+            print(f"warning: {path.name} kept its last usable reading (no agreement)")
+        extractions[path.name] = chosen
 
     total_paid = sum((item["amount_paid"] for item in extractions.values()), Decimal("0.00"))
     total_without_discount = sum(
