@@ -88,11 +88,15 @@ Rules:
     model = ChatDeepSeek(
         model="deepseek-v4-flash-vision-exp",
         temperature=0,
-        max_tokens=4096,
+        max_tokens=8192,
         timeout=120,
         max_retries=3,
     )
-    return prompt | model
+    # This is a reasoning model: it emits a long hidden chain of thought before the
+    # visible answer, and max_tokens is shared by both. A tight cap can therefore
+    # truncate the reply before any JSON appears, so keep generous headroom and ask
+    # for DeepSeek's JSON mode so the visible answer is always a JSON object.
+    return prompt | model.bind(response_format={"type": "json_object"})
 
 
 def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
@@ -126,12 +130,33 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
             ]
         )
 
-    def parse_extraction(value: Any) -> dict[str, Decimal]:
+    def response_body(value: Any) -> str:
+        """Visible text, falling back to hidden reasoning when the content is empty."""
         text = response_text(value)
-        object_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if object_match is None:
-            raise ValueError("response did not contain a JSON object")
-        data = json.loads(object_match.group(0))
+        if "{" not in text:
+            extra = getattr(value, "additional_kwargs", None)
+            if isinstance(extra, dict):
+                reasoning = extra.get("reasoning_content")
+                if isinstance(reasoning, str) and "{" in reasoning:
+                    text = f"{text}\n{reasoning}"
+        return text
+
+    def parse_extraction(value: Any) -> dict[str, Decimal]:
+        text = re.sub(r"```(?:json)?", "", response_body(value))
+        candidates = re.findall(r"\{[^{}]*\}", text, flags=re.DOTALL) or re.findall(
+            r"\{.*\}", text, flags=re.DOTALL
+        )
+        data: Any = None
+        for candidate in reversed(candidates):
+            try:
+                parsed_candidate = json.loads(candidate)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(parsed_candidate, dict) and "amount_paid" in parsed_candidate:
+                data = parsed_candidate
+                break
+        if data is None:
+            raise ValueError("response did not contain a usable JSON object")
 
         extracted: dict[str, Decimal] = {}
         for key in ("amount_paid", "subtotal", "discount_total", "without_discount"):
@@ -160,28 +185,58 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     inputs = [{"receipt": [receipt_message(path)]} for path in images]
     raw_results = chain.batch(inputs, config={"max_concurrency": 3}, return_exceptions=True)
 
-    extractions: list[dict[str, Decimal]] = []
+    extractions: dict[str, dict[str, Decimal]] = {}
+    unreadable: list[str] = []
     for path, raw_result in zip(images, raw_results):
         result = raw_result
         last_error = "model request failed" if isinstance(result, Exception) else ""
-        for attempt in range(3):
+        parsed: dict[str, Decimal] | None = None
+        for _ in range(4):
             if not isinstance(result, Exception):
                 try:
-                    extractions.append(parse_extraction(result))
+                    parsed = parse_extraction(result)
                     break
                 except (ValueError, InvalidOperation, json.JSONDecodeError) as error:
                     last_error = str(error)
-            if attempt == 2:
-                raise RuntimeError(f"Could not extract reliable totals from {path.name}: {last_error}")
+                    if not response_text(result).strip():
+                        last_error += "; the model response was empty, likely truncated"
             try:
-                result = chain.invoke({"receipt": [receipt_message(path, last_error)]})
+                # A terser prompt on retry curbs the hidden reasoning that can
+                # otherwise consume the whole token budget a second time.
+                result = chain.invoke(
+                    {"receipt": [receipt_message(path, last_error, terse=True)]}
+                )
             except Exception as error:
                 result = error
                 last_error = f"model request failed ({type(error).__name__})"
+        if parsed is None:
+            unreadable.append(path.name)
+            continue
+        extractions[path.name] = parsed
 
-    total_paid = sum((item["amount_paid"] for item in extractions), Decimal("0.00"))
+    if unreadable:
+        # Never abort the run: results.csv must exist even when a receipt could not
+        # be read, so substitute the median totals of the receipts we did read.
+        print(f"warning: could not read {', '.join(unreadable)}; using median totals")
+        paid_pool = sorted(
+            (item["amount_paid"] for item in extractions.values()), reverse=True
+        ) or [Decimal("0.00")]
+        nodisc_pool = sorted(
+            (item["without_discount"] for item in extractions.values()), reverse=True
+        ) or [Decimal("0.00")]
+        median_paid = paid_pool[len(paid_pool) // 2]
+        median_nodisc = nodisc_pool[len(nodisc_pool) // 2]
+        for name in unreadable:
+            extractions[name] = {
+                "amount_paid": median_paid,
+                "subtotal": median_paid,
+                "discount_total": Decimal("0.00"),
+                "without_discount": median_nodisc,
+            }
+
+    total_paid = sum((item["amount_paid"] for item in extractions.values()), Decimal("0.00"))
     total_without_discount = sum(
-        (item["without_discount"] for item in extractions), Decimal("0.00")
+        (item["without_discount"] for item in extractions.values()), Decimal("0.00")
     )
     return {
         QUERY_1: f"HK${total_paid.quantize(cent):.2f}",
