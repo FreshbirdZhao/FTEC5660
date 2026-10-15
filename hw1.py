@@ -67,7 +67,7 @@ def build_chain() -> Any:
     from langchain_deepseek import ChatDeepSeek
 
     extraction_instructions = """You are a meticulous forensic accountant reading one Hong Kong supermarket receipt.
-Read the receipt image twice before answering. Return only one valid JSON object with exactly these four keys:
+Read the receipt carefully but keep your reasoning brief. Return only one valid JSON object with exactly these four keys:
 {{"amount_paid": "0.00", "subtotal": "0.00", "discount_total": "0.00", "without_discount": "0.00"}}
 
 Rules:
@@ -116,13 +116,21 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
 
     cent = Decimal("0.01")
 
-    def receipt_message(path: Path, correction: str = "") -> HumanMessage:
+    def receipt_message(path: Path, correction: str = "", terse: bool = False) -> HumanMessage:
         instruction = (
             f"Extract the four required totals from receipt {path.name}. "
             "Return the JSON object only."
         )
+        if terse:
+            instruction += (
+                " Work quickly: keep your notes short, do not restate the receipt "
+                "line by line, then output the JSON object."
+            )
         if correction:
-            instruction += f" The previous extraction was unreliable: {correction} Re-read the image and correct it."
+            instruction += (
+                f" The previous attempt failed: {correction[:300]} "
+                "Re-read the image and return the JSON object."
+            )
         return HumanMessage(
             content=[
                 {"type": "text", "text": instruction},
@@ -190,8 +198,10 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
     for path, raw_result in zip(images, raw_results):
         result = raw_result
         last_error = "model request failed" if isinstance(result, Exception) else ""
+        if isinstance(result, Exception):
+            print(f"warning: {path.name} initial request failed ({type(result).__name__})")
         parsed: dict[str, Decimal] | None = None
-        for _ in range(4):
+        for attempt in range(4):
             if not isinstance(result, Exception):
                 try:
                     parsed = parse_extraction(result)
@@ -200,6 +210,7 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
                     last_error = str(error)
                     if not response_text(result).strip():
                         last_error += "; the model response was empty, likely truncated"
+                    print(f"warning: {path.name} attempt {attempt + 1} rejected ({last_error[:200]})")
             try:
                 # A terser prompt on retry curbs the hidden reasoning that can
                 # otherwise consume the whole token budget a second time.
@@ -209,7 +220,9 @@ def answer_queries(chain: Any, images: list[Path]) -> dict[str, Any]:
             except Exception as error:
                 result = error
                 last_error = f"model request failed ({type(error).__name__})"
+                print(f"warning: {path.name} attempt {attempt + 1} request failed ({last_error[:200]})")
         if parsed is None:
+            print(f"warning: {path.name} unreadable after retries ({last_error})")
             unreadable.append(path.name)
             continue
         extractions[path.name] = parsed
